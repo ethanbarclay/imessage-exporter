@@ -56,6 +56,19 @@ impl QueryContext {
         Ok(())
     }
 
+    /// Set the start date directly from a timestamp (for incremental exports)
+    /// # Example:
+    ///
+    /// ```
+    /// use imessage_database::util::query_context::QueryContext;
+    ///
+    /// let mut context = QueryContext::default();
+    /// context.set_start_timestamp(1640995200000000000); // 2022-01-01 00:00:00 UTC
+    /// ```
+    pub fn set_start_timestamp(&mut self, timestamp: i64) {
+        self.start = Some(timestamp);
+    }
+
     /// Populate a [`QueryContext`] with a list of handle IDs to select
     ///
     /// # Example:

@@ -91,7 +91,13 @@ impl<'a> Exporter<'a> for HTML<'a> {
         let mut orphaned = config.options.export_path.clone();
         orphaned.push(ORPHANED);
         orphaned.set_extension("html");
-        let file = File::options().append(true).create(true).open(&orphaned)?;
+
+        // Use SMB-compatible file opening strategy
+        let file = if orphaned.exists() {
+            File::options().append(true).open(&orphaned)?
+        } else {
+            File::create(&orphaned)?
+        };
 
         Ok(HTML {
             config,
@@ -186,7 +192,12 @@ impl<'a> Exporter<'a> for HTML<'a> {
                         // This can happen if multiple chats use the same group name
                         let file_exists = path.exists();
 
-                        let file = File::options().append(true).create(true).open(&path)?;
+                        // Use different file opening strategy for better SMB compatibility
+                        let file = if file_exists {
+                            File::options().append(true).open(&path)?
+                        } else {
+                            File::create(&path)?
+                        };
 
                         let mut buf = BufWriter::new(file);
 

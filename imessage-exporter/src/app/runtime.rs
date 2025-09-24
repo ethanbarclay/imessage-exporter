@@ -364,33 +364,54 @@ impl Config {
 
     /// Ensure there is available disk space for the requested export
     fn ensure_free_space(&self) -> Result<(), RuntimeError> {
-        // Export size is usually about 6% the size of the db; we divide by 10 to over-estimate about 10% of the total size
-        // for some safe headroom
-        let total_db_size = get_db_size(Path::new(
-            self.db().path().ok_or(RuntimeError::FileNameError)?,
-        ))?;
-        let mut estimated_export_size = total_db_size / 10;
-
         let free_space_at_location = available_space(&self.options.export_path)?;
-
-        // Validate that there is enough disk space free to write the export
-        if let AttachmentManagerMode::Disabled = self.options.attachment_manager.mode {
-            if estimated_export_size >= free_space_at_location {
-                return Err(RuntimeError::NotEnoughAvailableSpace(
-                    estimated_export_size,
-                    free_space_at_location,
-                ));
+        
+        let estimated_export_size = if self.options.query_context.has_filters() {
+            // For filtered exports (including incremental), estimate based on message count
+            let message_count = Message::get_count(self.db(), &self.options.query_context)?;
+            let total_message_count = Message::get_count(self.db(), &imessage_database::util::query_context::QueryContext::default())?;
+            
+            if total_message_count > 0 {
+                let total_db_size = get_db_size(Path::new(
+                    self.db().path().ok_or(RuntimeError::FileNameError)?,
+                ))?;
+                
+                // Estimate size based on the ratio of filtered messages to total messages
+                let ratio = message_count as f64 / total_message_count as f64;
+                let base_estimated_size = (total_db_size as f64 * ratio / 10.0) as u64;
+                
+                // Add attachment size if attachments are enabled
+                if !matches!(self.options.attachment_manager.mode, AttachmentManagerMode::Disabled) {
+                    let attachment_size = Attachment::get_total_attachment_bytes(self.db(), &self.options.query_context)?;
+                    base_estimated_size + attachment_size
+                } else {
+                    base_estimated_size
+                }
+            } else {
+                // No messages to export
+                0
             }
         } else {
-            let total_attachment_size =
-                Attachment::get_total_attachment_bytes(self.db(), &self.options.query_context)?;
-            estimated_export_size += total_attachment_size;
-            if estimated_export_size >= free_space_at_location {
-                return Err(RuntimeError::NotEnoughAvailableSpace(
-                    estimated_export_size + total_attachment_size,
-                    free_space_at_location,
-                ));
+            // Full export - use original logic
+            let total_db_size = get_db_size(Path::new(
+                self.db().path().ok_or(RuntimeError::FileNameError)?,
+            ))?;
+            let mut estimated_size = total_db_size / 10;
+            
+            if !matches!(self.options.attachment_manager.mode, AttachmentManagerMode::Disabled) {
+                let attachment_size = Attachment::get_total_attachment_bytes(self.db(), &self.options.query_context)?;
+                estimated_size += attachment_size;
             }
+            
+            estimated_size
+        };
+
+        // Validate that there is enough disk space free to write the export
+        if estimated_export_size >= free_space_at_location {
+            return Err(RuntimeError::NotEnoughAvailableSpace(
+                estimated_export_size,
+                free_space_at_location,
+            ));
         }
 
         println!(
@@ -456,7 +477,7 @@ impl Config {
     /// let app = Config::new(options).unwrap();
     /// app.start();
     /// ```
-    pub fn start(&self) -> Result<(), RuntimeError> {
+    pub fn start(&mut self) -> Result<(), RuntimeError> {
         if self.options.diagnostic {
             self.run_diagnostic()?;
         } else if let Some(export_type) = &self.options.export_type {
@@ -467,6 +488,12 @@ impl Config {
                 return Err(RuntimeError::InvalidOptions(format!(
                     "Selected filter `{filters}` does not match any participants!"
                 )));
+            }
+
+            // Automatically detect if incremental export should be used
+            if let Some(last_timestamp) = self.find_last_message_timestamp()? {
+                eprintln!("Found existing export, starting incremental export from last message...");
+                self.options.query_context.set_start_timestamp(last_timestamp + 1);
             }
 
             // Ensure the path we want to export to exists
@@ -500,6 +527,93 @@ impl Config {
         }
         println!("Done!");
         Ok(())
+    }
+
+    /// Find the timestamp of the last message in existing export files
+    /// This is used for incremental exports to determine where to start from
+    /// Currently only supports HTML exports
+    fn find_last_message_timestamp(&self) -> Result<Option<i64>, RuntimeError> {
+        // Only support incremental exports for HTML format
+        if !matches!(self.options.export_type, Some(crate::app::export_type::ExportType::Html)) {
+            return Ok(None);
+        }
+        use std::fs;
+        use regex::Regex;
+        use chrono::NaiveDateTime;
+
+        let mut latest_timestamp: Option<i64> = None;
+        let mut files_processed = 0;
+        let mut _timestamps_found = 0;
+        let mut parsing_failures = 0;
+
+        // Pattern to match timestamp spans in HTML files
+        // Looking for: <span class="timestamp">Oct 14, 2021  8:41:16 PM (Read by...)</span>
+        let timestamp_regex = Regex::new(r#"<span class="timestamp">([^<]+)</span>"#)
+            .map_err(|_| RuntimeError::FileNameError)?;
+
+        // Pattern to extract just the date/time part before any parentheses
+        let datetime_regex = Regex::new(r"^([^(]+)")
+            .map_err(|_| RuntimeError::FileNameError)?;
+
+        // Read all HTML files in the export directory and extract timestamps
+        if let Ok(entries) = fs::read_dir(&self.options.export_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("html") {
+                    files_processed += 1;
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        // Find all timestamp spans in this file
+                        for captures in timestamp_regex.captures_iter(&content) {
+                            if let Some(timestamp_text) = captures.get(1) {
+                                // Extract just the datetime part (before parentheses)
+                                if let Some(datetime_match) = datetime_regex.captures(timestamp_text.as_str()) {
+                                    if let Some(datetime_str) = datetime_match.get(1) {
+                                        let clean_datetime = datetime_str.as_str().trim();
+
+                                        // Skip "Edited X seconds later" timestamps since they're not actual message timestamps
+                                        if clean_datetime.starts_with("Edited ") && clean_datetime.ends_with(" later") {
+                                            continue;
+                                        }
+
+                                        // Try to parse the datetime string with different formats
+                                        // Format 1: "Oct 14, 2021  8:41:16 PM" (double space)
+                                        // Format 2: "Oct 15, 2021 10:38:22 AM" (single space)
+                                        let parsed_dt = NaiveDateTime::parse_from_str(clean_datetime, "%b %d, %Y  %I:%M:%S %p")
+                                            .or_else(|_| NaiveDateTime::parse_from_str(clean_datetime, "%b %d, %Y %I:%M:%S %p"));
+
+                                        match parsed_dt {
+                                            Ok(naive_dt) => {
+                                                // Convert to Unix timestamp assuming local timezone
+                                                let unix_timestamp = naive_dt.and_utc().timestamp();
+                                                // Convert from Unix timestamp to iMessage timestamp
+                                                // iMessage epoch starts at 2001-01-01 00:00:00 UTC
+                                                // Unix epoch starts at 1970-01-01 00:00:00 UTC
+                                                // Difference is 978307200 seconds
+                                                let imessage_timestamp = (unix_timestamp - 978307200) * 1_000_000_000;
+
+                                                _timestamps_found += 1;
+                                                latest_timestamp = Some(latest_timestamp.map_or(imessage_timestamp, |current| current.max(imessage_timestamp)));
+                                            }
+                                            Err(_) => {
+                                                parsing_failures += 1;
+                                                // Note: Failed timestamp parsing is expected for non-standard formats like "Edited X later"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Log summary for debugging if needed
+        if parsing_failures > 0 {
+            eprintln!("Warning: {} timestamp parsing failures encountered while scanning {} HTML files", parsing_failures, files_processed);
+        }
+
+        Ok(latest_timestamp)
     }
 
     /// Determine who sent a message

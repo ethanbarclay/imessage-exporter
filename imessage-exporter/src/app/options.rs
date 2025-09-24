@@ -267,9 +267,24 @@ fn validate_path(
     let resolved_path =
         PathBuf::from(export_path.unwrap_or(&format!("{}/{DEFAULT_OUTPUT_DIR}", home())));
 
-    // If there is an export type selected, ensure we do not overwrite files of the same type
+    // Check if directory has existing exports - if so, we'll use incremental mode automatically
+    let has_existing_exports = resolved_path.exists() &&
+        resolved_path.read_dir()
+            .map(|mut entries| entries.any(|entry| {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    path.extension().and_then(|ext| ext.to_str()) == Some("html") ||
+                    path.extension().and_then(|ext| ext.to_str()) == Some("txt")
+                } else {
+                    false
+                }
+            }))
+            .unwrap_or(false);
+
+    // If there is an export type selected and no existing exports, ensure we do not overwrite files of the same type
     if let Some(export_type) = export_type
         && resolved_path.exists()
+        && !has_existing_exports
     {
         // Get the word to use if there is a problem with the specified path
         let path_word = match export_path {
@@ -849,6 +864,7 @@ mod arg_tests {
             ignore_disk_space: false,
             conversation_filter: Some(String::from("steve@apple.com")),
             cleartext_password: None,
+            incremental: false,
         };
 
         assert_eq!(actual, expected);
@@ -981,6 +997,7 @@ mod arg_tests {
             ignore_disk_space: true,
             conversation_filter: None,
             cleartext_password: None,
+            incremental: false,
         };
 
         assert_eq!(actual, expected);
