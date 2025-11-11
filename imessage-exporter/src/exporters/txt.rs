@@ -6,6 +6,7 @@ use std::{
     fmt::Write as FmtWrite,
     fs::File,
     io::{BufWriter, Write},
+    path::PathBuf,
 };
 
 use crate::{
@@ -56,8 +57,14 @@ pub struct TXT<'a> {
     /// Handles to files we want to write messages to
     /// Map of resolved chatroom file location to a buffered writer
     pub files: HashMap<String, BufWriter<File>>,
+    /// Map of resolved chatroom file location to actual file paths (for deduplication)
+    pub file_paths: HashMap<String, PathBuf>,
+    /// Cache of existing timestamps per file for fast deduplication
+    pub existing_timestamps: HashMap<String, std::collections::HashSet<String>>,
     /// Writer instance for orphaned messages
     pub orphaned: BufWriter<File>,
+    /// Path to orphaned file
+    pub orphaned_path: PathBuf,
     /// Progress Bar model for alerting the user about current export state
     pb: ExportProgress,
 }
@@ -65,16 +72,19 @@ pub struct TXT<'a> {
 // MARK: Exporter
 impl<'a> Exporter<'a> for TXT<'a> {
     fn new(config: &'a Config) -> Result<Self, RuntimeError> {
-        let mut orphaned = config.options.export_path.clone();
-        orphaned.push(ORPHANED);
-        orphaned.set_extension("txt");
+        let mut orphaned_path = config.options.export_path.clone();
+        orphaned_path.push(ORPHANED);
+        orphaned_path.set_extension("txt");
 
-        let file = File::options().append(true).create(true).open(&orphaned)?;
+        let file = File::options().append(true).create(true).open(&orphaned_path)?;
 
         Ok(TXT {
             config,
             files: HashMap::new(),
+            file_paths: HashMap::new(),
+            existing_timestamps: HashMap::new(),
             orphaned: BufWriter::new(file),
+            orphaned_path,
             pb: ExportProgress::new(),
         })
     }
@@ -119,12 +129,52 @@ impl<'a> Exporter<'a> for TXT<'a> {
             // Render the announcement in-line
             if msg.is_announcement() {
                 let announcement = self.format_announcement(&msg);
-                TXT::write_to_file(self.get_or_create_file(&msg)?, &announcement)?;
+                let filename = if let Some((chatroom, _)) = self.config.conversation(&msg) {
+                    self.config.filename(chatroom)
+                } else {
+                    "orphaned".to_string()
+                };
+                let path = self.get_file_path(&msg);
+
+                // Check if message exists before getting file handle
+                if !self.message_exists_cached(&filename, &path, &announcement)? {
+                    let file = self.get_or_create_file(&msg)?;
+                    TXT::write_to_file(file, &announcement)?;
+
+                    // Add to cache
+                    let first_line = announcement.lines().next().unwrap_or("").trim();
+                    if !first_line.is_empty() {
+                        self.existing_timestamps
+                            .entry(filename)
+                            .or_insert_with(std::collections::HashSet::new)
+                            .insert(first_line.to_string());
+                    }
+                }
             }
             // Message tapbacks and poll votes are rendered in context, so no need to render them
             else if !msg.is_tapback() && !msg.is_poll_vote() && !msg.is_poll_update() {
                 let message = self.format_message(&msg, 0)?;
-                TXT::write_to_file(self.get_or_create_file(&msg)?, &message)?;
+                let filename = if let Some((chatroom, _)) = self.config.conversation(&msg) {
+                    self.config.filename(chatroom)
+                } else {
+                    "orphaned".to_string()
+                };
+                let path = self.get_file_path(&msg);
+
+                // Check if message exists before getting file handle
+                if !self.message_exists_cached(&filename, &path, &message)? {
+                    let file = self.get_or_create_file(&msg)?;
+                    TXT::write_to_file(file, &message)?;
+
+                    // Add to cache
+                    let first_line = message.lines().next().unwrap_or("").trim();
+                    if !first_line.is_empty() {
+                        self.existing_timestamps
+                            .entry(filename)
+                            .or_insert_with(std::collections::HashSet::new)
+                            .insert(first_line.to_string());
+                    }
+                }
             }
             current_message += 1;
             if current_message % 99 == 0 {
@@ -143,7 +193,7 @@ impl<'a> Exporter<'a> for TXT<'a> {
         match self.config.conversation(message) {
             Some((chatroom, _)) => {
                 let filename = self.config.filename(chatroom);
-                match self.files.entry(filename) {
+                match self.files.entry(filename.clone()) {
                     Occupied(entry) => Ok(entry.into_mut()),
                     Vacant(entry) => {
                         let mut path = self.config.options.export_path.clone();
@@ -151,6 +201,9 @@ impl<'a> Exporter<'a> for TXT<'a> {
                         path.set_extension("txt");
 
                         let file = File::options().append(true).create(true).open(&path)?;
+
+                        // Cache the path for deduplication
+                        self.file_paths.insert(filename.clone(), path);
 
                         Ok(entry.insert(BufWriter::new(file)))
                     }
@@ -163,6 +216,95 @@ impl<'a> Exporter<'a> for TXT<'a> {
     fn write_to_file(file: &mut BufWriter<File>, text: &str) -> Result<(), RuntimeError> {
         file.write_all(text.as_bytes())
             .map_err(RuntimeError::DiskError)
+    }
+}
+
+// MARK: TXT Deduplication Helper Methods
+impl<'a> TXT<'a> {
+    /// Get the file path for the given message
+    fn get_file_path(&self, message: &Message) -> PathBuf {
+        match self.config.conversation(message) {
+            Some((chatroom, _)) => {
+                let filename = self.config.filename(chatroom);
+                self.file_paths.get(&filename).cloned().unwrap_or_else(|| {
+                    let mut path = self.config.options.export_path.clone();
+                    path.push(filename);
+                    path.set_extension("txt");
+                    path
+                })
+            }
+            None => self.orphaned_path.clone(),
+        }
+    }
+
+    /// Load existing timestamps from a file into the cache
+    fn load_existing_timestamps(&mut self, filename: &str, path: &std::path::Path) -> Result<(), RuntimeError> {
+        use std::io::{BufRead, BufReader};
+        use std::collections::HashSet;
+
+        // If already cached, skip
+        if self.existing_timestamps.contains_key(filename) {
+            return Ok(());
+        }
+
+        let mut timestamps = HashSet::new();
+
+        // If file doesn't exist, return empty set
+        if !path.exists() {
+            self.existing_timestamps.insert(filename.to_string(), timestamps);
+            return Ok(());
+        }
+
+        // Open file for reading
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+
+        // Only read last N lines for efficiency
+        // Increased to handle large conversations with long messages
+        const MAX_LINES_TO_CACHE: usize = 20000;
+        let mut lines: Vec<String> = Vec::new();
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                lines.push(line);
+            }
+        }
+
+        // Cache the last N lines that look like timestamps
+        for line in lines.iter().rev().take(MAX_LINES_TO_CACHE) {
+            let trimmed = line.trim();
+            // Check if this looks like a timestamp line (starts with month abbreviation)
+            if trimmed.len() > 15 && trimmed.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if let Some(second_char) = trimmed.chars().nth(1) {
+                    if second_char.is_lowercase() {
+                        timestamps.insert(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        self.existing_timestamps.insert(filename.to_string(), timestamps);
+        Ok(())
+    }
+
+    /// Check if the message already exists using the cached timestamps
+    fn message_exists_cached(&mut self, filename: &str, path: &std::path::Path, message_text: &str) -> Result<bool, RuntimeError> {
+        // Ensure timestamps are loaded for this file
+        self.load_existing_timestamps(filename, path)?;
+
+        // Extract the first line (timestamp) from the message
+        let first_line = message_text.lines().next().unwrap_or("").trim();
+
+        // If no timestamp line, can't deduplicate reliably, so allow it
+        if first_line.is_empty() {
+            return Ok(false);
+        }
+
+        // Check if this timestamp exists in our cache
+        if let Some(timestamps) = self.existing_timestamps.get(filename) {
+            Ok(timestamps.contains(first_line))
+        } else {
+            Ok(false)
+        }
     }
 }
 

@@ -414,10 +414,12 @@ impl Config {
             ));
         }
 
-        println!(
-            "Estimated export size: {}",
-            format_file_size(estimated_export_size)
-        );
+        if estimated_export_size > 0 {
+            println!(
+                "Estimated export size: {}",
+                format_file_size(estimated_export_size)
+            );
+        }
 
         Ok(())
     }
@@ -492,8 +494,19 @@ impl Config {
 
             // Automatically detect if incremental export should be used
             if let Some(last_timestamp) = self.find_last_message_timestamp()? {
-                eprintln!("Found existing export, starting incremental export from last message...");
+                // Convert timestamp back to human-readable for debugging
+                use imessage_database::util::dates::{TIMESTAMP_FACTOR, get_offset};
+                use chrono::DateTime;
+                let seconds = (last_timestamp / TIMESTAMP_FACTOR) + get_offset();
+                let datetime = DateTime::from_timestamp(seconds, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                eprintln!("Found existing export, starting incremental export from last message at: {}", datetime);
+                eprintln!("  Last timestamp value: {}", last_timestamp);
+                eprintln!("  Query will fetch messages with timestamp > {}", last_timestamp);
                 self.options.query_context.set_start_timestamp(last_timestamp + 1);
+            } else {
+                eprintln!("No existing export found, performing full export");
             }
 
             // Ensure the path we want to export to exists
@@ -531,76 +544,107 @@ impl Config {
 
     /// Find the timestamp of the last message in existing export files
     /// This is used for incremental exports to determine where to start from
-    /// Currently only supports HTML exports
+    /// Supports both HTML and TXT exports
+    ///
+    /// Returns the maximum (most recent) last message timestamp across all conversations
+    /// This may cause some messages to be re-exported in conversations that ended earlier,
+    /// but deduplication will prevent duplicates
     fn find_last_message_timestamp(&self) -> Result<Option<i64>, RuntimeError> {
-        // Only support incremental exports for HTML format
-        if !matches!(self.options.export_type, Some(crate::app::export_type::ExportType::Html)) {
+        // Only support incremental exports for HTML and TXT formats
+        if !matches!(
+            self.options.export_type,
+            Some(crate::app::export_type::ExportType::Html) | Some(crate::app::export_type::ExportType::Txt)
+        ) {
             return Ok(None);
         }
         use std::fs;
         use regex::Regex;
-        use chrono::NaiveDateTime;
 
-        let mut latest_timestamp: Option<i64> = None;
+        let mut latest_last_timestamp: Option<i64> = None;
         let mut files_processed = 0;
         let mut _timestamps_found = 0;
         let mut parsing_failures = 0;
 
+        // Determine which file extension we're looking for based on export type
+        let file_extension = match self.options.export_type {
+            Some(crate::app::export_type::ExportType::Html) => "html",
+            Some(crate::app::export_type::ExportType::Txt) => "txt",
+            _ => return Ok(None), // Should never happen due to check above
+        };
+
         // Pattern to match timestamp spans in HTML files
         // Looking for: <span class="timestamp">Oct 14, 2021  8:41:16 PM (Read by...)</span>
-        let timestamp_regex = Regex::new(r#"<span class="timestamp">([^<]+)</span>"#)
+        // OR: <span class="timestamp"><a ...>Oct 14, 2021  8:41:16 PM</a> (Read by...)</span>
+        // We need to extract the text content, which might be wrapped in an anchor tag
+        let html_timestamp_regex = Regex::new(r#"<span class="timestamp">(?:<a[^>]*>)?([^<]+)(?:</a>)?"#)
+            .map_err(|_| RuntimeError::FileNameError)?;
+
+        // Pattern to match timestamp lines in TXT files
+        // Looking for lines that start with a date like: "Dec 05, 2021  6:26:43 PM (Read by...)"
+        // This matches the first line of each message block
+        let txt_timestamp_regex = Regex::new(r"^([A-Z][a-z]{2} \d{1,2}, \d{4}\s+\d{1,2}:\d{2}:\d{2} [AP]M)")
             .map_err(|_| RuntimeError::FileNameError)?;
 
         // Pattern to extract just the date/time part before any parentheses
         let datetime_regex = Regex::new(r"^([^(]+)")
             .map_err(|_| RuntimeError::FileNameError)?;
 
-        // Read all HTML files in the export directory and extract timestamps
+        // Read all files in the export directory and extract timestamps
         if let Ok(entries) = fs::read_dir(&self.options.export_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("html") {
+                if path.extension().and_then(|s| s.to_str()) == Some(file_extension) {
                     files_processed += 1;
                     if let Ok(content) = fs::read_to_string(&path) {
-                        // Find all timestamp spans in this file
-                        for captures in timestamp_regex.captures_iter(&content) {
-                            if let Some(timestamp_text) = captures.get(1) {
-                                // Extract just the datetime part (before parentheses)
-                                if let Some(datetime_match) = datetime_regex.captures(timestamp_text.as_str()) {
-                                    if let Some(datetime_str) = datetime_match.get(1) {
-                                        let clean_datetime = datetime_str.as_str().trim();
+                        // Choose the appropriate regex based on file type
+                        if file_extension == "html" {
+                            // Find the LAST timestamp in this HTML file
+                            // We need to find the last message, not all messages
+                            let mut file_last_timestamp: Option<i64> = None;
 
-                                        // Skip "Edited X seconds later" timestamps since they're not actual message timestamps
-                                        if clean_datetime.starts_with("Edited ") && clean_datetime.ends_with(" later") {
-                                            continue;
-                                        }
+                            for captures in html_timestamp_regex.captures_iter(&content) {
+                                if let Some(timestamp_text) = captures.get(1) {
+                                    if let Some(imessage_timestamp) = Self::parse_timestamp_to_imessage_format(
+                                        timestamp_text.as_str(),
+                                        &datetime_regex,
+                                    ) {
+                                        _timestamps_found += 1;
+                                        // Track the maximum (latest) timestamp in THIS file
+                                        file_last_timestamp = Some(file_last_timestamp.map_or(imessage_timestamp, |current| current.max(imessage_timestamp)));
+                                    } else {
+                                        parsing_failures += 1;
+                                    }
+                                }
+                            }
 
-                                        // Try to parse the datetime string with different formats
-                                        // Format 1: "Oct 14, 2021  8:41:16 PM" (double space)
-                                        // Format 2: "Oct 15, 2021 10:38:22 AM" (single space)
-                                        let parsed_dt = NaiveDateTime::parse_from_str(clean_datetime, "%b %d, %Y  %I:%M:%S %p")
-                                            .or_else(|_| NaiveDateTime::parse_from_str(clean_datetime, "%b %d, %Y %I:%M:%S %p"));
+                            // Now take the maximum (most recent) of all files' last timestamps
+                            if let Some(file_ts) = file_last_timestamp {
+                                latest_last_timestamp = Some(latest_last_timestamp.map_or(file_ts, |current| current.max(file_ts)));
+                            }
+                        } else {
+                            // TXT file: find the LAST timestamp in this file
+                            let mut file_last_timestamp: Option<i64> = None;
 
-                                        match parsed_dt {
-                                            Ok(naive_dt) => {
-                                                // Convert to Unix timestamp assuming local timezone
-                                                let unix_timestamp = naive_dt.and_utc().timestamp();
-                                                // Convert from Unix timestamp to iMessage timestamp
-                                                // iMessage epoch starts at 2001-01-01 00:00:00 UTC
-                                                // Unix epoch starts at 1970-01-01 00:00:00 UTC
-                                                // Difference is 978307200 seconds
-                                                let imessage_timestamp = (unix_timestamp - 978307200) * 1_000_000_000;
-
-                                                _timestamps_found += 1;
-                                                latest_timestamp = Some(latest_timestamp.map_or(imessage_timestamp, |current| current.max(imessage_timestamp)));
-                                            }
-                                            Err(_) => {
-                                                parsing_failures += 1;
-                                                // Note: Failed timestamp parsing is expected for non-standard formats like "Edited X later"
-                                            }
+                            for line in content.lines() {
+                                if let Some(captures) = txt_timestamp_regex.captures(line) {
+                                    if let Some(timestamp_text) = captures.get(1) {
+                                        if let Some(imessage_timestamp) = Self::parse_timestamp_to_imessage_format(
+                                            timestamp_text.as_str(),
+                                            &datetime_regex,
+                                        ) {
+                                            _timestamps_found += 1;
+                                            // Track the maximum (latest) timestamp in THIS file
+                                            file_last_timestamp = Some(file_last_timestamp.map_or(imessage_timestamp, |current| current.max(imessage_timestamp)));
+                                        } else {
+                                            parsing_failures += 1;
                                         }
                                     }
                                 }
+                            }
+
+                            // Now take the maximum (most recent) of all files' last timestamps
+                            if let Some(file_ts) = file_last_timestamp {
+                                latest_last_timestamp = Some(latest_last_timestamp.map_or(file_ts, |current| current.max(file_ts)));
                             }
                         }
                     }
@@ -608,12 +652,62 @@ impl Config {
             }
         }
 
-        // Log summary for debugging if needed
-        if parsing_failures > 0 {
-            eprintln!("Warning: {} timestamp parsing failures encountered while scanning {} HTML files", parsing_failures, files_processed);
+        // Log summary for debugging
+        if let Some(ts) = latest_last_timestamp {
+            use imessage_database::util::dates::{TIMESTAMP_FACTOR, get_offset};
+            use chrono::DateTime;
+            let seconds = (ts / TIMESTAMP_FACTOR) + get_offset();
+            let datetime = DateTime::from_timestamp(seconds, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            eprintln!("Scanned {} {} files, found {} timestamps, latest: {}",
+                files_processed, file_extension, _timestamps_found, datetime);
         }
 
-        Ok(latest_timestamp)
+        if parsing_failures > 0 {
+            eprintln!("Warning: {} timestamp parsing failures encountered while scanning {} {} files", parsing_failures, files_processed, file_extension);
+        }
+
+        Ok(latest_last_timestamp)
+    }
+
+    /// Helper function to parse timestamp strings and convert them to iMessage format
+    /// Returns None if parsing fails
+    fn parse_timestamp_to_imessage_format(
+        timestamp_text: &str,
+        datetime_regex: &regex::Regex,
+    ) -> Option<i64> {
+        use chrono::NaiveDateTime;
+
+        // Extract just the datetime part (before parentheses like "(Read by...)")
+        let datetime_match = datetime_regex.captures(timestamp_text)?;
+        let datetime_str = datetime_match.get(1)?;
+        let clean_datetime = datetime_str.as_str().trim();
+
+        // Skip "Edited X seconds later" timestamps since they're not actual message timestamps
+        if clean_datetime.starts_with("Edited ") && clean_datetime.ends_with(" later") {
+            return None;
+        }
+
+        // Try to parse the datetime string with different formats
+        // Format 1: "Oct 14, 2021  8:41:16 PM" (double space)
+        // Format 2: "Oct 15, 2021 10:38:22 AM" (single space)
+        let parsed_dt = NaiveDateTime::parse_from_str(clean_datetime, "%b %d, %Y  %I:%M:%S %p")
+            .or_else(|_| NaiveDateTime::parse_from_str(clean_datetime, "%b %d, %Y %I:%M:%S %p"));
+
+        match parsed_dt {
+            Ok(naive_dt) => {
+                // Convert to Unix timestamp assuming local timezone
+                let unix_timestamp = naive_dt.and_utc().timestamp();
+                // Convert from Unix timestamp to iMessage timestamp
+                // iMessage epoch starts at 2001-01-01 00:00:00 UTC
+                // Unix epoch starts at 1970-01-01 00:00:00 UTC
+                // Difference is 978307200 seconds
+                let imessage_timestamp = (unix_timestamp - 978307200) * 1_000_000_000;
+                Some(imessage_timestamp)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Determine who sent a message

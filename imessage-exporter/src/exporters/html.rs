@@ -11,6 +11,7 @@ use std::{
     fmt::Write as FmtWrite,
     fs::File,
     io::{BufWriter, Write},
+    path::PathBuf,
 };
 
 use crate::{
@@ -79,8 +80,14 @@ pub struct HTML<'a> {
     /// Handles to files we want to write messages to
     /// Map of resolved chatroom file location to a buffered writer
     pub files: HashMap<String, BufWriter<File>>,
+    /// Map of resolved chatroom file location to actual file paths (for deduplication)
+    pub file_paths: HashMap<String, PathBuf>,
+    /// Cache of existing timestamp signatures per file for fast deduplication
+    pub existing_timestamps: HashMap<String, std::collections::HashSet<String>>,
     /// Writer instance for orphaned messages
     pub orphaned: BufWriter<File>,
+    /// Path to orphaned file
+    pub orphaned_path: PathBuf,
     /// Progress Bar model for alerting the user about current export state
     pb: ExportProgress,
 }
@@ -88,43 +95,61 @@ pub struct HTML<'a> {
 // MARK: Exporter
 impl<'a> Exporter<'a> for HTML<'a> {
     fn new(config: &'a Config) -> Result<Self, RuntimeError> {
-        let mut orphaned = config.options.export_path.clone();
-        orphaned.push(ORPHANED);
-        orphaned.set_extension("html");
+        let mut orphaned_path = config.options.export_path.clone();
+        orphaned_path.push(ORPHANED);
+        orphaned_path.set_extension("html");
 
         // Use SMB-compatible file opening strategy
-        let file = if orphaned.exists() {
-            File::options().append(true).open(&orphaned)?
+        let file = if orphaned_path.exists() {
+            File::options().append(true).open(&orphaned_path)?
         } else {
-            File::create(&orphaned)?
+            File::create(&orphaned_path)?
         };
 
         Ok(HTML {
             config,
             files: HashMap::new(),
+            file_paths: HashMap::new(),
+            existing_timestamps: HashMap::new(),
             orphaned: BufWriter::new(file),
+            orphaned_path,
             pb: ExportProgress::new(),
         })
     }
 
     fn iter_messages(&mut self) -> Result<(), RuntimeError> {
-        // Tell the user what we are doing
-        eprintln!(
-            "Exporting to {} as html...",
-            self.config.options.export_path.display()
-        );
-
         // Write orphaned file headers
         HTML::write_headers(&mut self.orphaned)?;
 
         // Keep track of current message ROWID
         let mut current_message_row = -1;
 
-        // Set up progress bar
-        let mut current_message = 0;
-        let total_messages =
-            Message::get_count(self.config.db(), &self.config.options.query_context)?;
-        self.pb.start(total_messages);
+        // Track messages written for summary
+        let mut messages_written = 0;
+
+        // For incremental exports, pre-scan to count non-duplicate messages
+        let total_new_messages = if self.config.options.query_context.start.is_some() {
+            self.count_new_messages()?
+        } else {
+            Message::get_count(self.config.db(), &self.config.options.query_context)?
+        };
+
+        // Skip export if there are no new messages
+        if total_new_messages == 0 {
+            eprintln!("No new messages to export");
+            eprintln!("Writing HTML footers...");
+            for buf in self.files.values_mut() {
+                HTML::write_to_file(buf, FOOTER)?;
+            }
+            HTML::write_to_file(&mut self.orphaned, FOOTER)?;
+            return Ok(());
+        }
+
+        // Tell the user what we are doing
+        eprintln!(
+            "Exporting to {} as html...",
+            self.config.options.export_path.display()
+        );
 
         let mut statement =
             Message::stream_rows(self.config.db(), &self.config.options.query_context)?;
@@ -133,13 +158,15 @@ impl<'a> Exporter<'a> for HTML<'a> {
             .query_map([], |row| Ok(Message::from_row(row)))
             .map_err(|err| RuntimeError::DatabaseError(TableError::QueryError(err)))?;
 
+        // Start progress bar with known total
+        self.pb.start(total_new_messages);
+
         for message in messages {
             let mut msg = Message::extract(message)?;
 
             // Early escape if we try and render the same message GUID twice
             // See https://github.com/ReagentX/imessage-exporter/issues/135 for rationale
             if msg.rowid == current_message_row {
-                current_message += 1;
                 continue;
             }
             current_message_row = msg.rowid;
@@ -150,18 +177,89 @@ impl<'a> Exporter<'a> for HTML<'a> {
             // Render the announcement in-line
             if msg.is_announcement() {
                 let announcement = self.format_announcement(&msg);
-                HTML::write_to_file(self.get_or_create_file(&msg)?, &announcement)?;
+                let filename = if let Some((chatroom, _)) = self.config.conversation(&msg) {
+                    self.config.filename(chatroom)
+                } else {
+                    "orphaned".to_string()
+                };
+                let path = self.get_file_path(&msg);
+
+                // Check if message exists before getting file handle
+                if !self.message_exists_cached(&filename, &path, &announcement)? {
+                    let file = self.get_or_create_file(&msg)?;
+                    HTML::write_to_file(file, &announcement)?;
+                    messages_written += 1;
+                    self.pb.set_position(messages_written);
+
+                    // Add to cache - extract just the core timestamp
+                    use regex::Regex;
+                    let timestamp_regex = Regex::new(r#"<span class="timestamp">(?:<a[^>]*>)?([^<]+)(?:</a>)?"#)
+                        .unwrap_or_else(|_| panic!("Invalid timestamp regex"));
+
+                    if let Some(captures) = timestamp_regex.captures(&announcement) {
+                        if let Some(timestamp_text) = captures.get(1) {
+                            let text = timestamp_text.as_str();
+                            let core_timestamp = if let Some(paren_pos) = text.find('(') {
+                                text[..paren_pos].trim()
+                            } else {
+                                text.trim()
+                            };
+                            if !core_timestamp.is_empty() {
+                                self.existing_timestamps
+                                    .entry(filename)
+                                    .or_insert_with(std::collections::HashSet::new)
+                                    .insert(core_timestamp.to_string());
+                            }
+                        }
+                    }
+                }
             }
             // Message tapbacks and poll votes are rendered in context, so no need to render them separately
             else if !msg.is_tapback() && !msg.is_poll_vote() && !msg.is_poll_update() {
                 let message = self.format_message(&msg, 0)?;
-                HTML::write_to_file(self.get_or_create_file(&msg)?, &message)?;
-            }
-            current_message += 1;
-            if current_message % 99 == 0 {
-                self.pb.set_position(current_message);
+                let filename = if let Some((chatroom, _)) = self.config.conversation(&msg) {
+                    self.config.filename(chatroom)
+                } else {
+                    "orphaned".to_string()
+                };
+                let path = self.get_file_path(&msg);
+
+                // Check if message exists before getting file handle
+                let exists = self.message_exists_cached(&filename, &path, &message)?;
+                if !exists {
+                    let file = self.get_or_create_file(&msg)?;
+                    HTML::write_to_file(file, &message)?;
+                    messages_written += 1;
+                    self.pb.set_position(messages_written);
+
+                    // Add to cache - extract just the core timestamp
+                    use regex::Regex;
+                    let timestamp_regex = Regex::new(r#"<span class="timestamp">(?:<a[^>]*>)?([^<]+)(?:</a>)?"#)
+                        .unwrap_or_else(|_| panic!("Invalid timestamp regex"));
+
+                    if let Some(captures) = timestamp_regex.captures(&message) {
+                        if let Some(timestamp_text) = captures.get(1) {
+                            let text = timestamp_text.as_str();
+                            let core_timestamp = if let Some(paren_pos) = text.find('(') {
+                                text[..paren_pos].trim()
+                            } else {
+                                text.trim()
+                            };
+                            if !core_timestamp.is_empty() {
+                                self.existing_timestamps
+                                    .entry(filename)
+                                    .or_insert_with(std::collections::HashSet::new)
+                                    .insert(core_timestamp.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    // Message is a duplicate, but still need to process attachments
+                    self.process_attachments_only(&msg)?;
+                }
             }
         }
+
         self.pb.finish();
 
         eprintln!("Writing HTML footers...");
@@ -181,7 +279,7 @@ impl<'a> Exporter<'a> for HTML<'a> {
         match self.config.conversation(message) {
             Some((chatroom, _)) => {
                 let filename = self.config.filename(chatroom);
-                match self.files.entry(filename) {
+                match self.files.entry(filename.clone()) {
                     Occupied(entry) => Ok(entry.into_mut()),
                     Vacant(entry) => {
                         let mut path = self.config.options.export_path.clone();
@@ -206,6 +304,9 @@ impl<'a> Exporter<'a> for HTML<'a> {
                             let _ = HTML::write_headers(&mut buf);
                         }
 
+                        // Cache the path for deduplication
+                        self.file_paths.insert(filename.clone(), path);
+
                         Ok(entry.insert(buf))
                     }
                 }
@@ -217,6 +318,192 @@ impl<'a> Exporter<'a> for HTML<'a> {
     fn write_to_file(file: &mut BufWriter<File>, text: &str) -> Result<(), RuntimeError> {
         file.write_all(text.as_bytes())
             .map_err(RuntimeError::DiskError)
+    }
+}
+
+// MARK: HTML Deduplication Helper Methods
+impl<'a> HTML<'a> {
+    /// Get the file path for the given message
+    fn get_file_path(&self, message: &Message) -> PathBuf {
+        match self.config.conversation(message) {
+            Some((chatroom, _)) => {
+                let filename = self.config.filename(chatroom);
+                self.file_paths.get(&filename).cloned().unwrap_or_else(|| {
+                    let mut path = self.config.options.export_path.clone();
+                    path.push(filename);
+                    path.set_extension("html");
+                    path
+                })
+            }
+            None => self.orphaned_path.clone(),
+        }
+    }
+
+    /// Load existing timestamp signatures from a file into the cache
+    fn load_existing_timestamps(&mut self, filename: &str, path: &std::path::Path) -> Result<(), RuntimeError> {
+        use std::io::{BufRead, BufReader};
+        use std::collections::HashSet;
+
+        // If already cached, skip
+        if self.existing_timestamps.contains_key(filename) {
+            return Ok(());
+        }
+
+        let mut signatures = HashSet::new();
+
+        // If file doesn't exist, return empty set
+        if !path.exists() {
+            self.existing_timestamps.insert(filename.to_string(), signatures);
+            return Ok(());
+        }
+
+        // Open file for reading
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+
+        // Only read last N lines for efficiency
+        // Increased to handle large conversations with long messages
+        const MAX_LINES_TO_CACHE: usize = 20000;
+        let mut lines: Vec<String> = Vec::new();
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                lines.push(line);
+            }
+        }
+
+        // Cache timestamp signatures from the last N lines
+        // Extract just the timestamp text (e.g., "Nov 08, 2025 10:25:35 AM")
+        // not the full HTML, to handle variations in read receipts and anchor tags
+        use regex::Regex;
+        let timestamp_regex = Regex::new(r#"<span class="timestamp">(?:<a[^>]*>)?([^<]+)(?:</a>)?"#)
+            .unwrap_or_else(|_| panic!("Invalid timestamp regex"));
+
+        for line in lines.iter().rev().take(MAX_LINES_TO_CACHE) {
+            if let Some(captures) = timestamp_regex.captures(line) {
+                if let Some(timestamp_text) = captures.get(1) {
+                    // Extract just the date/time part before any parentheses (read receipts)
+                    let text = timestamp_text.as_str();
+                    let core_timestamp = if let Some(paren_pos) = text.find('(') {
+                        text[..paren_pos].trim()
+                    } else {
+                        text.trim()
+                    };
+                    if !core_timestamp.is_empty() {
+                        signatures.insert(core_timestamp.to_string());
+                    }
+                }
+            }
+        }
+
+        self.existing_timestamps.insert(filename.to_string(), signatures);
+        Ok(())
+    }
+
+    /// Check if the message already exists using the cached signatures
+    fn message_exists_cached(&mut self, filename: &str, path: &std::path::Path, message_text: &str) -> Result<bool, RuntimeError> {
+        // Ensure signatures are loaded for this file
+        self.load_existing_timestamps(filename, path)?;
+
+        // Extract just the core timestamp (date/time only, no read receipts)
+        use regex::Regex;
+        let timestamp_regex = Regex::new(r#"<span class="timestamp">(?:<a[^>]*>)?([^<]+)(?:</a>)?"#)
+            .unwrap_or_else(|_| panic!("Invalid timestamp regex"));
+
+        let core_timestamp = if let Some(captures) = timestamp_regex.captures(message_text) {
+            if let Some(timestamp_text) = captures.get(1) {
+                let text = timestamp_text.as_str();
+                // Extract just the date/time part before any parentheses (read receipts)
+                if let Some(paren_pos) = text.find('(') {
+                    text[..paren_pos].trim().to_string()
+                } else {
+                    text.trim().to_string()
+                }
+            } else {
+                return Ok(false); // Can't extract timestamp, allow message
+            }
+        } else {
+            return Ok(false); // No timestamp, allow message
+        };
+
+        // Check if this core timestamp exists in our cache
+        if let Some(signatures) = self.existing_timestamps.get(filename) {
+            Ok(signatures.contains(&core_timestamp))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Process attachments for a message without formatting the full message
+    /// This ensures attachments are copied even when the message is a duplicate
+    fn process_attachments_only(&self, message: &Message) -> Result<(), TableError> {
+        let mut attachments = Attachment::from_message(self.config.db(), message)?;
+
+        for attachment in attachments.iter_mut() {
+            // Copy the attachment file
+            self.config
+                .options
+                .attachment_manager
+                .handle_attachment(message, attachment, self.config);
+        }
+
+        Ok(())
+    }
+
+    /// Count how many messages are actually new (not duplicates) in an incremental export
+    fn count_new_messages(&mut self) -> Result<u64, RuntimeError> {
+        let mut count = 0u64;
+        let mut current_message_row = -1;
+
+        let mut statement =
+            Message::stream_rows(self.config.db(), &self.config.options.query_context)?;
+
+        let messages = statement
+            .query_map([], |row| Ok(Message::from_row(row)))
+            .map_err(|err| RuntimeError::DatabaseError(TableError::QueryError(err)))?;
+
+        for message in messages {
+            let mut msg = Message::extract(message)?;
+
+            // Skip duplicate rowids
+            if msg.rowid == current_message_row {
+                continue;
+            }
+            current_message_row = msg.rowid;
+
+            // Generate the text of the message
+            let _ = msg.generate_text(self.config.db());
+
+            // Check announcements
+            if msg.is_announcement() {
+                let announcement = self.format_announcement(&msg);
+                let filename = if let Some((chatroom, _)) = self.config.conversation(&msg) {
+                    self.config.filename(chatroom)
+                } else {
+                    "orphaned".to_string()
+                };
+                let path = self.get_file_path(&msg);
+
+                if !self.message_exists_cached(&filename, &path, &announcement)? {
+                    count += 1;
+                }
+            }
+            // Check regular messages
+            else if !msg.is_tapback() && !msg.is_poll_vote() && !msg.is_poll_update() {
+                let message = self.format_message(&msg, 0)?;
+                let filename = if let Some((chatroom, _)) = self.config.conversation(&msg) {
+                    self.config.filename(chatroom)
+                } else {
+                    "orphaned".to_string()
+                };
+                let path = self.get_file_path(&msg);
+
+                if !self.message_exists_cached(&filename, &path, &message)? {
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
     }
 }
 
